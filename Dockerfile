@@ -38,7 +38,7 @@ RUN poetry export \
     rm -rf /root/.cache
 
 RUN echo "/vocabirt" > \
-    /usr/local/lib/python3.8/dist-packages/vocabirt.pth
+    /usr/local/lib/python3.9/dist-packages/vocabirt.pth
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
