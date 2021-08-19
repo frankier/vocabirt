@@ -1,0 +1,210 @@
+## Environment variables
+from os.path import dirname
+from os.path import join as pjoin
+
+
+def cnf(name, val):
+    globals()[name] = config.setdefault(name, val)
+
+
+cnf("WORK", "work")
+
+# Inputs
+cnf("VOCABAQDATA", pjoin(WORK, "vocabaqdata"))
+cnf("TESTYOURVOCAB_NONNATIVE_DB", pjoin(VOCABAQDATA, "testyourvocab.nonnative.db"))
+cnf("EVKD1_TEST_ANSWERS_DF", pjoin(VOCABAQDATA, "evkd1_test_answers.parquet"))
+cnf("SVL12K_DF", pjoin(VOCABAQDATA, "ehara_svl12k.parquet"))
+
+# Intermediates
+cnf("EMBED", pjoin(WORK, "embed"))
+cnf("NUMBERBATCH_PATH", pjoin(EMBED, "numberbatch-en.txt.pt"))
+cnf("IRTS", pjoin(WORK, "irts"))
+cnf("IRTNN", pjoin(WORK, "irt_nns"))
+cnf("PATCHED_IRT", pjoin(WORK, "patched_irt"))
+cnf("IRT_EXT", pjoin(WORK, "irt_ext"))
+
+# Evals
+cnf("IRT_EVAL", pjoin(WORK, "irt_eval"))
+cnf("IRT_EXT_EVAL", pjoin(WORK, "irt_ext_eval"))
+
+
+rule download_numberbatch:
+    output:
+        pjoin(EMBED, "numberbatch-19.08.txt.gz")
+    shell:
+        "wget -O {output} https://conceptnet.s3.amazonaws.com/downloads/2019/numberbatch/numberbatch-19.08.txt.gz"
+
+
+rule select_language:
+    input:
+        pjoin(EMBED, "numberbatch-19.08.txt.gz")
+    output:
+        pjoin(EMBED, "numberbatch-{lang}.txt")
+    shell:
+        r"gzip -d < {input} | sed -n -e 's/^\/c\/{wildcards.lang}\///gp' > {output}"
+
+
+rule convert_numberbatch:
+    input:
+        pjoin(EMBED, "numberbatch-en.txt"),
+    output:
+        NUMBERBATCH_PATH
+    shell:
+        "python -m vocabirt.embed_nn.convert_word2vec {input}"
+
+
+rule get_jp_split:
+    input:
+        TESTYOURVOCAB_NONNATIVE_DB 
+    output:
+        pjoin(WORK, "testyourvocab.jp.parquet")
+    shell:
+        "python -m vocabirt.process_testyourvocab " +
+        " --split testjp {input} {output}"
+
+
+rule fit_irt:
+    "Fits a one or more IRT models for a given split-mode"
+    input:
+        SVL12K_DF
+    output:
+        directory(pjoin(IRTS, "{split_mode}"))
+    shell:
+        "mkdir -p {output} && " +
+        " python -m vocabirt.vocabirt2pl_svl12k_cv " +
+        " --split-mode {wildcards.split_mode} " +
+        SVL12K_DF + " {output}"
+
+
+rule fit_irt_nn:
+    input:
+        pjoin(IRTS, "{split_mode}")
+    output:
+        directory(pjoin(IRTNN, "{split_mode}", "pred"))
+    shell:
+        "mkdir -p {output} && " +
+        " NUMBERBATCH_PATH=" + NUMBERBATCH_PATH
+        " python -m vocabirt.embed_nn.cv_generalise_irt "
+        " --split-mode={wildcards.split_mode} " +
+        SVL12K_DF + " {input} " + pjoin(IRTNN, "{wildcards.split_mode}")
+
+
+def irt_input(wc):
+    if wc.split_mode in ("both", "word"):
+        return pjoin(IRTNN, wc.split_mode, "pred")
+    else:
+        return pjoin(IRTS, wc.split_mode)
+
+
+def eval_irt_input(wc):
+    if wc.patched == "wordfreq":
+        return pjoin(PATCHED_IRT, wc.split_mode)
+    else:
+        return irt_input(wc)
+
+
+rule patch_irts:
+    input:
+        irt_input
+    output:
+        directory(pjoin(PATCHED_IRT, "{split_mode}"))
+    shell:
+        "mkdir -p {output} && " +
+        " python -m vocabirt.patch_difficulties " +
+        " {input} {output}"
+
+
+rule eval_irt:
+    input:
+        eval_irt_input
+    output:
+        pjoin(IRT_EVAL, "{split_mode}.{strategy}.{estimator}.{patched}.{discrim}.pkl")
+    params:
+        discrim_preds=lambda wc: "--no-discrim-preds" if wc.discrim == "nodiscrim" else "--discrim-preds"
+    shell:
+        "mkdir -p " + IRT_EVAL + " && " +
+        "python -m vocabirt.discrimexp_cv " +
+        " --strategy {wildcards.strategy} " +
+        " --estimator {wildcards.estimator} " +
+        " {params.discrim_preds} " +
+        SVL12K_DF + " {input} {output}"
+
+
+rule eval_all_irt:
+    input:
+        [
+            pjoin(IRT_EVAL, f"{split_mode}.{strategy}.{estimator}.{patched}.{discrim_preds}.pkl")
+            for split_mode in ["respondent", "none", "word", "both"]
+            for strategy in ["random", "max-info", "urry"]
+            for estimator in ["hill-climb", "logistic"]
+            for patched in ["wordfreq", "raw"]
+            for discrim_preds in ["nodiscrim", "discrim"]
+        ]
+
+
+# Ext
+rule pred_ext_irt:
+    input:
+        evkd1 = EVKD1_RESP_DF,
+        testyourvocab = pjoin(WORK, "testyourvocab.jp.parquet"),
+        trained_model = pjoin(IRTNN, "none", "pred")
+    output:
+        pjoin(IRT_EXT, "pred.pkl")
+    shell:
+        "mkdir -p " + IRT_EXT + " && " +
+        "python -m vocabirt.embed_nn.infer_irt " +
+        "{input.evkd1} {input.testyourvocab} " +
+        pjoin(IRTNN, "none", "best.tar") + " {output}"
+
+
+rule merge_irts:
+    input:
+        pred_irt = pjoin(IRT_EXT, "pred.pkl"),
+        gold_irt = pjoin(IRTS, "none")
+    output:
+        pjoin(IRT_EXT, "{var}.pkl"),
+    params:
+        pred_mean=lambda wc: "--pred-mean" if wc.var == "goldmean" else "--keep-pred"
+    wildcard_constraints:
+        var=r"(mixed)|(goldmean)"
+    shell:
+        "python -m vocabirt.embed_nn.merge_irts " +
+        "{params.pred_mean} " +
+        "{input.pred_irt} {input.gold_irt}/resp0_vocab0.pkl " +
+        "{output}"
+
+
+rule patch_ext_irts:
+    input:
+        pjoin(IRT_EXT, "{base}.pkl")
+    output:
+        pjoin(IRT_EXT, "{base}.wordfreq.pkl")
+    shell:
+        "python -m vocabirt.patch_difficulties_one " +
+        " {input} {output}"
+
+
+rule eval_ext_irt:
+    input:
+        resps = lambda wc: EVKD1_RESP_DF if wc.split == "evkd1" else pjoin(WORK, "testyourvocab.jp.parquet"),
+        irts = pjoin(IRT_EXT, "{var}.pkl")
+    output:
+        pjoin(IRT_EXT_EVAL, "{split}", "{var}.{discrim}.pkl")
+    params:
+        discrim_preds=lambda wc: "--no-discrim-preds" if wc.discrim == "nodiscrim" else "--discrim-preds"
+    shell:
+        "mkdir -p " + IRT_EXT_EVAL + "/{wildcards.split} && " +
+        "python -m vocabirt.discrimexp_ext " +
+        " --fmt {wildcards.split} " +
+        " {params.discrim_preds} {input.resps} {input.irts} {output}"
+
+
+rule eval_all_ext_irt:
+    input:
+        [
+            pjoin(IRT_EXT_EVAL, split, f"{var}{diff_patch}.{discrim}.pkl")
+            for split in ["testyourvocab", "evkd1"]
+            for var in ["pred", "mixed", "goldmean"]
+            for diff_patch in ["", ".wordfreq"]
+            for discrim in ["discrim", "nodiscrim"]
+        ]
